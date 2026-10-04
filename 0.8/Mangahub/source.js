@@ -1085,7 +1085,7 @@ var _Sources = (() => {
   var MH_API_DOMAIN = "https://api.mghcdn.com/graphql";
   var MH_CDN_DOMAIN = "https://imgx.mghcdn.com";
   var MangahubInfo = {
-    version: "3.1.0",
+    version: "3.1.1",
     name: "Mangahub",
     icon: "icon.png",
     author: "Netsky",
@@ -1125,9 +1125,18 @@ var _Sources = (() => {
         }
       });
       this.stateManager = App.createSourceStateManager();
+      // Returns ONLY the token value (the API expects the bare token in x-mhub-access,
+      // not a "mhub_access=...; Max-Age=...; Path=/" cookie string).
       this.getMhubAccess = async () => {
-        return await this.stateManager.retrieve("mhub_key");
+        const cookie = this.getMhubCookie();
+        if (cookie?.value) return cookie.value;
+        const stored = await this.stateManager.retrieve("mhub_key") ?? "";
+        const match = /mhub_access=([^;]*)/.exec(stored);
+        return (match ? match[1] : stored) ?? "";
       };
+    }
+    getMhubCookie() {
+      return this.requestManager?.cookieStore?.getAllCookies().find((x) => x.name === "mhub_access" && x.value);
     }
     getMangaShareUrl(mangaId) {
       return `${MH_DOMAIN}/manga/${mangaId}`;
@@ -1201,6 +1210,31 @@ var _Sources = (() => {
       return parseChapters(data.data.manga.chapters, mangaId);
     }
     async getChapterDetails(mangaId, chapterId) {
+      let data = await this.fetchChapterData(mangaId, chapterId);
+      if (data?.errors) {
+        await this.refreshAPIKey();
+        data = await this.fetchChapterData(mangaId, chapterId);
+      }
+      if (data?.errors) {
+        throw new Error("API LIMIT EXCEEDED!\nTry doing the CloudFlare bypass again or come back later!");
+      }
+      if (!data?.data?.chapter?.pages) throw new Error(`Failed to parse chapter or pages property from data object mangaId:${mangaId} chapterId:${chapterId}`);
+      const pages = [];
+      try {
+        const parsedPages = JSON.parse(data.data.chapter.pages);
+        for (const img of parsedPages.i) {
+          pages.push(`${MH_CDN_DOMAIN}/${parsedPages.p}${img}`);
+        }
+      } catch (e) {
+        throw new Error(`${e}`);
+      }
+      return App.createChapterDetails({
+        id: chapterId,
+        mangaId,
+        pages
+      });
+    }
+    async fetchChapterData(mangaId, chapterId) {
       const request = App.createRequest({
         url: MH_API_DOMAIN,
         method: "POST",
@@ -1220,31 +1254,12 @@ var _Sources = (() => {
         }
       });
       const response = await this.requestManager.schedule(request, 1);
-      let data;
       try {
-        data = JSON.parse(response.data);
+        return JSON.parse(response.data);
       } catch (e) {
         console.log(`${e}`);
+        return void 0;
       }
-      if (data?.errors) {
-        await this.refreshAPIKey();
-        throw new Error("API LIMIT EXCEEDED!\nTry doing to CloudFlare again bypass or come back later!");
-      }
-      if (!data.data?.chapter?.pages) throw new Error(`Failed to parse chapter or pages property from data object mangaId:${mangaId} chapterId:${chapterId}`);
-      const pages = [];
-      try {
-        const parsedPages = JSON.parse(data.data.chapter.pages);
-        for (const img of parsedPages.i) {
-          pages.push(`${MH_CDN_DOMAIN}/${parsedPages.p}${img}`);
-        }
-      } catch (e) {
-        throw new Error(`${e}`);
-      }
-      return App.createChapterDetails({
-        id: chapterId,
-        mangaId,
-        pages
-      });
     }
     async getSearchTags() {
       const request = App.createRequest({
@@ -1488,6 +1503,7 @@ var _Sources = (() => {
     }
     async getCloudflareBypassRequestAsync() {
       await this.stateManager.store("userAgent", "null");
+      await this.stateManager.store("mhub_key", "");
       return App.createRequest({
         url: `${MH_DOMAIN}/chapter/the-last-human/chapter-1?reloadKey=1`,
         method: "GET",
@@ -1498,32 +1514,31 @@ var _Sources = (() => {
       });
     }
     async refreshAPIKey() {
-      await this.stateManager.store("mhub_key", "mhub_access=; Max-Age=0; Path=/");
-      this.requestManager?.cookieStore?.getAllCookies().forEach((x) => {
-        this.requestManager?.cookieStore?.removeCookie(x);
-      });
+      const cookieStore = this.requestManager?.cookieStore;
+      cookieStore?.getAllCookies().filter((x) => x.name === "mhub_access").forEach((x) => cookieStore.removeCookie(x));
+      await this.stateManager.store("mhub_key", "");
       const request = App.createRequest({
         url: `${MH_DOMAIN}/chapter/the-last-human/chapter-1?reloadKey=1`,
         method: "GET",
         headers: {
           "Referer": `${MH_DOMAIN}/`,
-          "User-Agent": await this.requestManager.getDefaultUserAgent(),
-          "Cookie": await this.stateManager.retrieve("mhub_key")
+          "User-Agent": await this.requestManager.getDefaultUserAgent()
         }
       });
       const response = await this.requestManager.schedule(request, 1);
-      const cookieHeaders = response.headers["Set-Cookie"];
-      let mhub_key = "";
-      if (cookieHeaders) {
-        const match = /mhub_access=([^;]+)/.exec(cookieHeaders);
-        if (match) {
-          const mhubAccess = match[1] ?? "";
-          mhub_key = mhubAccess;
-        }
+      let mhubKey = "";
+      for (const [name, value] of Object.entries(response.headers ?? {})) {
+        if (name.toLowerCase() !== "set-cookie") continue;
+        const raw = Array.isArray(value) ? value.join("; ") : String(value);
+        const match = /mhub_access=([^;]+)/.exec(raw);
+        if (match?.[1]) mhubKey = match[1];
       }
-      const now = Date.now();
-      const expires = now + 2 * 60 * 60 * 24 * 31;
-      await this.stateManager.store("mhub_key", `mhub_access=${mhub_key}; Max-Age=${expires}; Path=/`);
+      if (!mhubKey) mhubKey = this.getMhubCookie()?.value ?? "";
+      if (mhubKey) {
+        await this.stateManager.store("mhub_key", mhubKey);
+      } else {
+        console.log("[Mangahub] refreshAPIKey: no new mhub_access token received");
+      }
     }
   };
   return __toCommonJS(Mangahub_exports);
