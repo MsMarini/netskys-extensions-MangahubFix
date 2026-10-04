@@ -552,5 +552,3 @@ export class Mangahub implements SearchResultsProviding, MangaProviding, Chapter
     }
 
 }
-
-
