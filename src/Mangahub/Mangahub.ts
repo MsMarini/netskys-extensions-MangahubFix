@@ -33,7 +33,7 @@ const MH_API_DOMAIN = 'https://api.mghcdn.com/graphql'
 const MH_CDN_DOMAIN = 'https://imgx.mghcdn.com'
 
 export const MangahubInfo: SourceInfo = {
-    version: '3.1.0',
+    version: '3.1.1',
     name: 'Mangahub',
     icon: 'icon.png',
     author: 'Netsky',
@@ -76,8 +76,22 @@ export class Mangahub implements SearchResultsProviding, MangaProviding, Chapter
 
     stateManager = App.createSourceStateManager()
 
+    // Returns ONLY the token value (the API expects the bare token in x-mhub-access,
+    // not a "mhub_access=...; Max-Age=...; Path=/" cookie string).
     getMhubAccess = async (): Promise<string> => {
-        return await this.stateManager.retrieve('mhub_key')
+        // 1. Prefer the live cookie (set by the Cloudflare bypass webview or a refresh)
+        const cookie = this.getMhubCookie()
+        if (cookie?.value) return cookie.value
+
+        // 2. Fall back to the stored token (also handles the old "mhub_access=xyz; ..." format)
+        const stored: string = (await this.stateManager.retrieve('mhub_key')) ?? ''
+        const match = /mhub_access=([^;]*)/.exec(stored)
+        return (match ? match[1] : stored) ?? ''
+    }
+
+    getMhubCookie() {
+        return this.requestManager?.cookieStore?.getAllCookies()
+            .find(x => x.name === 'mhub_access' && x.value)
     }
 
     getMangaShareUrl(mangaId: string): string { return `${MH_DOMAIN}/manga/${mangaId}` }
@@ -158,6 +172,39 @@ export class Mangahub implements SearchResultsProviding, MangaProviding, Chapter
     }
 
     async getChapterDetails(mangaId: string, chapterId: string): Promise<ChapterDetails> {
+        let data = await this.fetchChapterData(mangaId, chapterId)
+
+        if (data?.errors) {
+            // Token is used up: grab a fresh one and retry ONCE before giving up
+            await this.refreshAPIKey()
+            data = await this.fetchChapterData(mangaId, chapterId)
+        }
+
+        if (data?.errors) {
+            throw new Error('API LIMIT EXCEEDED!\nTry doing the CloudFlare bypass again or come back later!')
+        }
+
+        if (!data?.data?.chapter?.pages) throw new Error(`Failed to parse chapter or pages property from data object mangaId:${mangaId} chapterId:${chapterId}`)
+        const pages: string[] = []
+
+        try {
+            const parsedPages = JSON.parse(data.data.chapter.pages)
+            for (const img of parsedPages.i) {
+                pages.push(`${MH_CDN_DOMAIN}/${parsedPages.p}${img}`)
+            }
+
+        } catch (e) {
+            throw new Error(`${e}`)
+        }
+
+        return App.createChapterDetails({
+            id: chapterId,
+            mangaId: mangaId,
+            pages: pages
+        })
+    }
+
+    async fetchChapterData(mangaId: string, chapterId: string): Promise<any> {
         const request = App.createRequest({
             url: MH_API_DOMAIN,
             method: 'POST',
@@ -179,37 +226,13 @@ export class Mangahub implements SearchResultsProviding, MangaProviding, Chapter
 
         const response = await this.requestManager.schedule(request, 1)
 
-        let data
         try {
-            data = JSON.parse(response.data as string)
+            return JSON.parse(response.data as string)
         } catch (e) {
             // Silently log errors
             console.log(`${e}`)
+            return undefined
         }
-
-        if (data?.errors) {
-            await this.refreshAPIKey()
-            throw new Error('API LIMIT EXCEEDED!\nTry doing to CloudFlare again bypass or come back later!')
-        }
-
-        if (!data.data?.chapter?.pages) throw new Error(`Failed to parse chapter or pages property from data object mangaId:${mangaId} chapterId:${chapterId}`)
-        const pages: string[] = []
-
-        try {
-            const parsedPages = JSON.parse(data.data.chapter.pages)
-            for (const img of parsedPages.i) {
-                pages.push(`${MH_CDN_DOMAIN}/${parsedPages.p}${img}`)
-            }
-
-        } catch (e) {
-            throw new Error(`${e}`)
-        }
-
-        return App.createChapterDetails({
-            id: chapterId,
-            mangaId: mangaId,
-            pages: pages
-        })
     }
 
     async getSearchTags(): Promise<TagSection[]> {
@@ -473,6 +496,10 @@ export class Mangahub implements SearchResultsProviding, MangaProviding, Chapter
         // Remove stored UserAgent
         await this.stateManager.store('userAgent', 'null')
 
+        // Forget the old stored token so the fresh mhub_access cookie
+        // the bypass webview receives is the one that gets used
+        await this.stateManager.store('mhub_key', '')
+
         return App.createRequest({
             url: `${MH_DOMAIN}/chapter/the-last-human/chapter-1?reloadKey=1`,
             method: 'GET',
@@ -483,41 +510,45 @@ export class Mangahub implements SearchResultsProviding, MangaProviding, Chapter
         })
     }
 
-    async refreshAPIKey() {
-        // Reset stored access key
-        await this.stateManager.store('mhub_key', 'mhub_access=; Max-Age=0; Path=/')
+    async refreshAPIKey(): Promise<void> {
+        // Only drop the stale mhub_access cookie. Do NOT wipe every cookie,
+        // that also deletes cf_clearance and undoes the Cloudflare bypass.
+        const cookieStore = this.requestManager?.cookieStore
+        cookieStore?.getAllCookies()
+            .filter(x => x.name === 'mhub_access')
+            .forEach(x => cookieStore.removeCookie(x))
+        await this.stateManager.store('mhub_key', '')
 
-        // Delete cookies
-        this.requestManager?.cookieStore?.getAllCookies().forEach(x => { this.requestManager?.cookieStore?.removeCookie(x) })
-
-        // Request new access token
+        // Visiting a chapter page with reloadKey=1 makes the site issue a new token
         const request = App.createRequest({
             url: `${MH_DOMAIN}/chapter/the-last-human/chapter-1?reloadKey=1`,
             method: 'GET',
             headers: {
                 'Referer': `${MH_DOMAIN}/`,
-                'User-Agent': await this.requestManager.getDefaultUserAgent(),
-                'Cookie': await this.stateManager.retrieve('mhub_key')
+                'User-Agent': await this.requestManager.getDefaultUserAgent()
             }
         })
 
         const response = await this.requestManager.schedule(request, 1)
 
-        const cookieHeaders = response.headers['Set-Cookie']
-
-        let mhub_key = ''
-        if (cookieHeaders) {
-            const match = /mhub_access=([^;]+)/.exec(cookieHeaders)
-            if (match) {
-                const mhubAccess = match[1] ?? ''
-                mhub_key = mhubAccess
-            }
+        // Header names can come back in any case ("Set-Cookie" vs "set-cookie"),
+        // and multiple cookies may arrive as an array
+        let mhubKey = ''
+        for (const [name, value] of Object.entries(response.headers ?? {})) {
+            if (name.toLowerCase() !== 'set-cookie') continue
+            const raw = Array.isArray(value) ? value.join('; ') : String(value)
+            const match = /mhub_access=([^;]+)/.exec(raw)
+            if (match?.[1]) mhubKey = match[1]
         }
 
-        const now: number = Date.now()
-        const expires: number = now + 2 * 60 * 60 * 24 * 31
+        // Paperback may have put it straight into the cookie store instead
+        if (!mhubKey) mhubKey = this.getMhubCookie()?.value ?? ''
 
-        await this.stateManager.store('mhub_key', `mhub_access=${mhub_key}; Max-Age=${expires}; Path=/`)
+        if (mhubKey) {
+            await this.stateManager.store('mhub_key', mhubKey)
+        } else {
+            console.log('[Mangahub] refreshAPIKey: no new mhub_access token received')
+        }
     }
 
 }
