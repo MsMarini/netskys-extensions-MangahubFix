@@ -1703,7 +1703,7 @@ var _Sources = (() => {
   var MH_API_DOMAIN = "https://api.mghcdn.com/graphql";
   var MH_CDN_DOMAIN = "https://imgx.mghcdn.com";
   var MangahubInfo = {
-    version: "3.2.0",
+    version: "3.2.1",
     name: "Mangahub",
     icon: "icon.png",
     author: "Netsky",
@@ -1762,15 +1762,8 @@ var _Sources = (() => {
       return `${MH_DOMAIN}/manga/${mangaId}`;
     }
     async getMangaDetails(mangaId) {
-      const request = App.createRequest({
-        url: MH_API_DOMAIN,
-        method: "POST",
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json"
-        },
-        data: {
-          query: `query {
+      const data = await this.apiQuery(
+        `query {
                     manga(x: m01, slug: "${mangaId}") {
                         title
                         alternativeTitle
@@ -1781,31 +1774,18 @@ var _Sources = (() => {
                         genres
                         description
                         isPorn
-                        isSoftPorn                    
+                        isSoftPorn
                     }
-                 }`
-        }
-      });
-      const response = await this.requestManager.schedule(request, 1);
-      let data;
-      try {
-        data = JSON.parse(response.data);
-      } catch (e) {
-        throw new Error(`${e}`);
-      }
-      if (!data.data?.manga) throw new Error(`Failed to parse manga property from data object mangaId:${mangaId}`);
+                 }`,
+        (d) => !!d?.data?.manga,
+        `manga details for ${mangaId}`,
+        `${MH_DOMAIN}/manga/${mangaId}`
+      );
       return parseMangaDetails(data.data.manga, mangaId);
     }
     async getChapters(mangaId) {
-      const request = App.createRequest({
-        url: MH_API_DOMAIN,
-        method: "POST",
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json"
-        },
-        data: {
-          query: `query {
+      const data = await this.apiQuery(
+        `query {
                     manga(x: m01, slug: "${mangaId}") {
                         title
                         chapters {
@@ -1813,32 +1793,28 @@ var _Sources = (() => {
                           title
                           slug
                           date
-                        }                  
+                        }
                     }
-                 }`
-        }
-      });
-      const response = await this.requestManager.schedule(request, 1);
-      let data;
-      try {
-        data = JSON.parse(response.data);
-      } catch (e) {
-        throw new Error(`${e}`);
-      }
-      if (!data.data?.manga) throw new Error(`Failed to parse manga property from data object mangaId:${mangaId}`);
-      if (data.data.manga.chapters?.length == 0) throw new Error(`Failed to parse chapters property from manga object mangaId:${mangaId}`);
+                 }`,
+        (d) => Array.isArray(d?.data?.manga?.chapters) && d.data.manga.chapters.length > 0,
+        `chapter list for ${mangaId}`,
+        `${MH_DOMAIN}/manga/${mangaId}`
+      );
       return parseChapters(data.data.manga.chapters, mangaId);
     }
     async getChapterDetails(mangaId, chapterId) {
-      let data = await this.fetchChapterData(mangaId, chapterId);
-      if (data?.errors) {
-        await this.refreshAPIKey();
-        data = await this.fetchChapterData(mangaId, chapterId);
-      }
-      if (data?.errors) {
-        throw new Error("API LIMIT EXCEEDED!\nTry doing the CloudFlare bypass again or come back later!");
-      }
-      if (!data?.data?.chapter?.pages) throw new Error(`Failed to parse chapter or pages property from data object mangaId:${mangaId} chapterId:${chapterId}`);
+      const data = await this.apiQuery(
+        `query {
+                    chapter(x: m01, slug: "${mangaId}", number: ${Number(chapterId)}) {
+                      pages
+                      title
+                      slug
+                    }
+                  }`,
+        (d) => !!d?.data?.chapter?.pages,
+        `chapter ${chapterId} of ${mangaId}`,
+        `${MH_DOMAIN}/chapter/${mangaId}/chapter-${chapterId}`
+      );
       let pagesString = data.data.chapter.pages;
       if (isEncryptedPages(pagesString)) {
         pagesString = await this.decryptChapterPages(pagesString);
@@ -1868,7 +1844,9 @@ var _Sources = (() => {
         pages
       });
     }
-    async fetchChapterData(mangaId, chapterId) {
+    // Sends one GraphQL request. Returns the parsed JSON, or undefined if the
+    // response wasn't JSON (e.g. a Cloudflare / rate-limit HTML page).
+    async sendQuery(query) {
       const request = App.createRequest({
         url: MH_API_DOMAIN,
         method: "POST",
@@ -1876,24 +1854,34 @@ var _Sources = (() => {
           "Accept": "application/json",
           "Content-Type": "application/json"
         },
-        data: {
-          query: `query {
-                    chapter(x: m01, slug: "${mangaId}", number: ${Number(chapterId)}) {
-                      pages
-                      title
-                      slug
-                    }
-                  }
-                  `
-        }
+        data: { query }
       });
       const response = await this.requestManager.schedule(request, 1);
+      let data;
       try {
-        return JSON.parse(response.data);
+        data = JSON.parse(response.data);
       } catch (e) {
-        console.log(`${e}`);
-        return void 0;
+        data = void 0;
       }
+      return { status: response.status, data };
+    }
+    // Runs a query; if the answer is missing, an error, or not JSON (usually a used-up
+    // token), refreshes the token and retries ONCE before giving a descriptive error.
+    async apiQuery(query, isValid, what, refreshUrl) {
+      let result = await this.sendQuery(query);
+      if (!result.data?.errors && isValid(result.data)) return result.data;
+      await this.refreshAPIKey(refreshUrl);
+      result = await this.sendQuery(query);
+      if (!result.data?.errors && isValid(result.data)) return result.data;
+      const serverMessage = result.data?.errors?.[0]?.message;
+      if (serverMessage) {
+        throw new Error(`MangaHub refused the request for ${what}: ${serverMessage}
+Try the CloudFlare bypass again or come back later.`);
+      }
+      if (result.data === void 0) {
+        throw new Error(`MangaHub sent an unreadable response (HTTP ${result.status}) for ${what}. You may be rate limited or need to redo the CloudFlare bypass.`);
+      }
+      throw new Error(`MangaHub returned no data for ${what}. It may have been removed from the site.`);
     }
     async getSearchTags() {
       const request = App.createRequest({
@@ -2187,12 +2175,13 @@ var _Sources = (() => {
       if (!params?.key && !params?.keys) throw new Error("Chapter decryption key response was empty");
       return params;
     }
-    async refreshAPIKey() {
+    async refreshAPIKey(refreshUrl) {
       const cookieStore = this.requestManager?.cookieStore;
       cookieStore?.getAllCookies().filter((x) => x.name === "mhub_access").forEach((x) => cookieStore.removeCookie(x));
       await this.stateManager.store("mhub_key", "");
+      const pageUrl = refreshUrl ?? `${MH_DOMAIN}/chapter/the-last-human/chapter-1`;
       const request = App.createRequest({
-        url: `${MH_DOMAIN}/chapter/the-last-human/chapter-1?reloadKey=1`,
+        url: `${pageUrl}?reloadKey=1`,
         method: "GET",
         headers: {
           "Referer": `${MH_DOMAIN}/`,
