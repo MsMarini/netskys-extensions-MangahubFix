@@ -11,6 +11,7 @@
   "author": "Netsky",
   "license": "GPL-3.0-or-later",
   "devDependencies": {
+    "@noble/ciphers": "^1.3.0",
     "@tsconfig/recommended": "^1.0.7",
     "@typescript-eslint/eslint-plugin": "^5.62.0",
     "@typescript-eslint/parser": "^5.62.0",
