@@ -28,12 +28,19 @@ import {
     parseSearch
 } from './MangahubParser'
 
+import {
+    ChapterCryptoParams,
+    decryptPages,
+    getEncryptedKeyId,
+    isEncryptedPages
+} from './MangahubCrypto'
+
 const MH_DOMAIN = 'https://mangahub.io'
 const MH_API_DOMAIN = 'https://api.mghcdn.com/graphql'
 const MH_CDN_DOMAIN = 'https://imgx.mghcdn.com'
 
 export const MangahubInfo: SourceInfo = {
-    version: '3.1.1',
+    version: '3.2.0',
     name: 'Mangahub',
     icon: 'icon.png',
     author: 'Netsky',
@@ -185,17 +192,35 @@ export class Mangahub implements SearchResultsProviding, MangaProviding, Chapter
         }
 
         if (!data?.data?.chapter?.pages) throw new Error(`Failed to parse chapter or pages property from data object mangaId:${mangaId} chapterId:${chapterId}`)
-        const pages: string[] = []
 
-        try {
-            const parsedPages = JSON.parse(data.data.chapter.pages)
-            for (const img of parsedPages.i) {
-                pages.push(`${MH_CDN_DOMAIN}/${parsedPages.p}${img}`)
-            }
-
-        } catch (e) {
-            throw new Error(`${e}`)
+        let pagesString: string = data.data.chapter.pages
+        if (isEncryptedPages(pagesString)) {
+            pagesString = await this.decryptChapterPages(pagesString)
         }
+
+        let parsedPages: any
+        try {
+            parsedPages = JSON.parse(pagesString)
+        } catch (e) {
+            throw new Error(`Failed to parse pages for mangaId:${mangaId} chapterId:${chapterId} - ${e}`)
+        }
+
+        // The site has used a few shapes for this: {p, i[]}, a plain array, or an object of paths
+        let paths: string[] = []
+        if (Array.isArray(parsedPages)) {
+            paths = parsedPages.map(String)
+        } else if (parsedPages && Array.isArray(parsedPages.i)) {
+            const prefix: string = parsedPages.p ?? ''
+            paths = parsedPages.i.map((img: string) => `${prefix}${img}`)
+        } else if (parsedPages && typeof parsedPages === 'object') {
+            paths = Object.values(parsedPages).map(String)
+        }
+
+        const pages = paths.map(path =>
+            /^https?:\/\//.test(path) ? path : `${MH_CDN_DOMAIN}/${path.replace(/^\/+/, '')}`
+        )
+
+        if (pages.length == 0) throw new Error(`No pages found for mangaId:${mangaId} chapterId:${chapterId}`)
 
         return App.createChapterDetails({
             id: chapterId,
@@ -510,6 +535,62 @@ export class Mangahub implements SearchResultsProviding, MangaProviding, Chapter
         })
     }
 
+    // Cache of chapter decryption keys, keyed by keyId
+    cryptoKeys: Record<string, string> = {}
+
+    async decryptChapterPages(pages: string): Promise<string> {
+        const keyId = getEncryptedKeyId(pages)
+
+        if (keyId && this.cryptoKeys[keyId]) {
+            try {
+                return decryptPages(pages, { keys: { [keyId]: this.cryptoKeys[keyId] as string } })
+            } catch (e) {
+                // Cached key no longer valid, fetch a fresh one below
+                delete this.cryptoKeys[keyId]
+            }
+        }
+
+        const params = await this.fetchChapterCrypto()
+        if (params.keys) Object.assign(this.cryptoKeys, params.keys)
+        if (params.key && params.keyId) this.cryptoKeys[params.keyId] = params.key
+
+        try {
+            return decryptPages(pages, params)
+        } catch (e) {
+            throw new Error(`Failed to decrypt chapter pages: ${e}`)
+        }
+    }
+
+    async fetchChapterCrypto(): Promise<ChapterCryptoParams> {
+        // Send the site's own cookies (cf_clearance etc.) plus the current access token
+        const token = await this.getMhubAccess()
+        const cookies = (this.requestManager?.cookieStore?.getAllCookies() ?? [])
+            .filter(x => x.domain.includes('mangahub.io') && x.name !== 'mhub_access')
+            .map(x => `${x.name}=${x.value}`)
+        if (token) cookies.push(`mhub_access=${token}`)
+
+        const request = App.createRequest({
+            url: `${MH_DOMAIN}/api/chapter-crypto`,
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                ...(cookies.length ? { 'Cookie': cookies.join('; ') } : {})
+            }
+        })
+
+        const response = await this.requestManager.schedule(request, 1)
+
+        let params: ChapterCryptoParams
+        try {
+            params = JSON.parse(response.data as string)
+        } catch (e) {
+            throw new Error(`Could not get the chapter decryption key (HTTP ${response.status}). Try the CloudFlare bypass again.`)
+        }
+
+        if (!params?.key && !params?.keys) throw new Error('Chapter decryption key response was empty')
+        return params
+    }
+
     async refreshAPIKey(): Promise<void> {
         // Only drop the stale mhub_access cookie. Do NOT wipe every cookie,
         // that also deletes cf_clearance and undoes the Cloudflare bypass.
@@ -552,4 +633,3 @@ export class Mangahub implements SearchResultsProviding, MangaProviding, Chapter
     }
 
 }
-
